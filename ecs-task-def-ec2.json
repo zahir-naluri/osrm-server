@@ -1,0 +1,55 @@
+{
+    "family": "osrm-server-task",
+    "networkMode": "bridge",
+    "requiresCompatibilities": [
+        "EC2"
+    ],
+    "cpu": "1024",
+    "memory": "4608",
+    "containerDefinitions": [
+        {
+            "name": "osrm",
+            "image": "<OSRM_IMAGE_URI>",
+            "cpu": 512,
+            "memory": 3072,
+            "essential": true,
+            "portMappings": [
+                {
+                    "containerPort": 5000,
+                    "hostPort": 5001,
+                    "protocol": "tcp"
+                }
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/osrm-server-task",
+                    "awslogs-region": "ap-southeast-1",
+                    "awslogs-stream-prefix": "osrm"
+                }
+            }
+        },
+        {
+            "name": "photon",
+            "image": "<PHOTON_IMAGE_URI>",
+            "cpu": 512,
+            "memory": 1536,
+            "essential": true,
+            "portMappings": [
+                {
+                    "containerPort": 2322,
+                    "hostPort": 2322,
+                    "protocol": "tcp"
+                }
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/osrm-server-task",
+                    "awslogs-region": "ap-southeast-1",
+                    "awslogs-stream-prefix": "photon"
+                }
+            }
+        }
+    ]
+}

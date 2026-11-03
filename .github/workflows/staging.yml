@@ -1,0 +1,121 @@
+name: Deploy to ECS EC2
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - staging
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_REPOSITORY_OSRM: osrm-server-osrm
+  ECR_REPOSITORY_PHOTON: osrm-server-photon
+  # update ECS_CLUSTER to whats used in cloud
+  ECS_CLUSTER: common_cluster_name
+  ECS_SERVICE: osrm-server-service
+  ECS_TASK_FAMILY: osrm-server-task
+  ECS_CAPACITY_PROVIDER: va-capacity-provider
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: development
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # The OSRM build needs several GB of scratch space for the routing graph.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+
+      - name: Ensure ECR repositories exist
+        run: |
+          for REPO in $ECR_REPOSITORY_OSRM $ECR_REPOSITORY_PHOTON; do
+            aws ecr describe-repositories --repository-names $REPO >/dev/null 2>&1 \
+              || aws ecr create-repository --repository-name $REPO
+          done
+
+      # --no-cache so every deploy pulls the latest OSM extract and Photon dump.
+      - name: Build and push OSRM image
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          IMAGE_BASE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_OSRM }}
+          docker build --no-cache -f osrm/Dockerfile -t $IMAGE_BASE:$IMAGE_TAG -t $IMAGE_BASE:latest osrm
+          docker push $IMAGE_BASE:$IMAGE_TAG
+          docker push $IMAGE_BASE:latest
+          echo "OSRM_IMAGE_URI=$IMAGE_BASE:$IMAGE_TAG" >> $GITHUB_ENV
+          docker image prune -af
+
+      - name: Build and push Photon image
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          IMAGE_BASE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_PHOTON }}
+          docker build --no-cache -f photon/Dockerfile -t $IMAGE_BASE:$IMAGE_TAG -t $IMAGE_BASE:latest photon
+          docker push $IMAGE_BASE:$IMAGE_TAG
+          docker push $IMAGE_BASE:latest
+          echo "PHOTON_IMAGE_URI=$IMAGE_BASE:$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Prepare ECS task definition
+        run: |
+          cp ecs-task-def-ec2.json filled-task-def.json
+          sed -i "s|<OSRM_IMAGE_URI>|$OSRM_IMAGE_URI|g" filled-task-def.json
+          sed -i "s|<PHOTON_IMAGE_URI>|$PHOTON_IMAGE_URI|g" filled-task-def.json
+
+      - name: Register ECS task definition
+        id: task-def
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://filled-task-def.json \
+            --query "taskDefinition.taskDefinitionArn" --output text)
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
+          echo "Registered TASK_DEF_ARN=$TASK_DEF_ARN"
+
+      - name: Create ECS service if not exists
+        run: |
+          SERVICE_EXISTS=$(aws ecs describe-services --cluster $ECS_CLUSTER --services $ECS_SERVICE --query "services[0].status" --output text || echo "MISSING")
+          if [ "$SERVICE_EXISTS" = "ACTIVE" ]; then
+            echo "Service already exists."
+          else
+            echo "Creating service $ECS_SERVICE in cluster $ECS_CLUSTER using capacity provider '$ECS_CAPACITY_PROVIDER'"
+            aws ecs create-service \
+              --cluster $ECS_CLUSTER \
+              --service-name $ECS_SERVICE \
+              --task-definition $TASK_DEF_ARN \
+              --desired-count 1 \
+              --capacity-provider-strategy capacityProvider=$ECS_CAPACITY_PROVIDER,weight=1
+          fi
+
+      - name: Ensure log group exists
+        run: |
+          aws logs create-log-group \
+            --log-group-name /ecs/${{ env.ECS_TASK_FAMILY }} \
+            --region ${{ env.AWS_REGION }} || true
+
+      # Bridge mode with fixed host ports: stop the old task before starting the new one
+      # so the ports are free (otherwise the rollout stalls on a single instance).
+      - name: Update ECS EC2 service
+        run: |
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --task-definition $TASK_DEF_ARN \
+            --deployment-configuration minimumHealthyPercent=0,maximumPercent=100 \
+            --force-new-deployment

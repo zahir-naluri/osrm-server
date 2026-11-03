@@ -1,0 +1,22 @@
+# Local development: serves the data built by scripts/build-*.sh from the host volumes.
+# Deployed images bake the data in instead (see osrm/Dockerfile, photon/Dockerfile).
+services:
+  osrm:
+    image: ghcr.io/project-osrm/osrm-backend:v26.10.0-debian
+    command: osrm-routed --algorithm mld /data/current/region.osrm
+    ports:
+      - "127.0.0.1:5001:5000"
+    volumes:
+      - ./osrm-data:/data:ro
+    restart: unless-stopped
+
+  photon:
+    build:
+      context: ./photon
+      target: base
+    command: java -Xmx2g -jar /opt/photon.jar serve -data-dir /data/current -listen-ip 0.0.0.0
+    ports:
+      - "127.0.0.1:2322:2322"
+    volumes:
+      - ./photon-data:/data
+    restart: unless-stopped
